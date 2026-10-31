@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>按住</title>
+<style>
+  * { margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: 'Helvetica Neue', 'PingFang SC', 'Songti SC', serif;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+
+  /* ── 唯一一行字：近乎隐形的碑文 ── */
+  #epigraph {
+    position: fixed;
+    left: 0; right: 0; bottom: 9vh;
+    text-align: center;
+    font-size: clamp(12px, 2.2vw, 15px);
+    letter-spacing: 0.42em;
+    color: rgba(255,255,255,0.16);
+    font-weight: 300;
+    pointer-events: none;
+    z-index: 10;
+    transition: color 1.2s ease, letter-spacing 1.2s ease;
+    text-indent: 0.42em;
+  }
+  body.alive #epigraph {
+    color: rgba(255,255,255,0.30);
+    letter-spacing: 0.52em;
+  }
+  /* ── 计数：极简、退后 ── */
+  #count {
+    position: fixed;
+    top: 5.5vh; left: 0; right: 0;
+    text-align: center;
+    font-size: 10px;
+    letter-spacing: 0.5em;
+    color: rgba(255,255,255,0.13);
+    font-weight: 300;
+    pointer-events: none;
+    z-index: 10;
+    text-indent: 0.5em;
+  }
+  #count b { font-weight: 300; color: rgba(255,255,255,0.4); margin-right: 0.6em; }
+</style>
+</head>
+<body>
+<div id="count"><b id="cnum">0</b>次</div>
+<canvas id="gl"></canvas>
+<div id="epigraph">按住，直到你不再需要</div>
+
+<script>
+(() => {
+  'use strict';
+  const canvas = document.getElementById('gl');
+  const gl = canvas.getContext('webgl', { antialias: true, premultipliedAlpha: false });
+
+  const VS = `
+    attribute vec2 p;
+    void main() { gl_Position = vec4(p, 0.0, 1.0); }
+  `;
+
+  /* ── 片元着色器：只有光 ── */
+  const FS = `
+    precision highp float;
+    uniform vec2  u_res;
+    uniform float u_time;
+    uniform float u_intensity; // 0..1 按压强度（平滑）
+    uniform float u_life;      // 0..1 本次按压已持续多久的映射
+    uniform float u_pulse;     // 触底脉冲
+
+    void main(){
+      vec2 uv = (gl_FragCoord.xy - 0.5*u_res) / min(u_res.x, u_res.y);
+      float t = u_time;
+      float I = u_intensity;
+      float r = length(uv);
+
+      // ── 光的半径：随强度膨胀 ──
+      float radius = mix(0.10, 0.62, I);
+
+      // ── 核心光晕：多层高斯叠加，极度柔和 ──
+      float core = exp(-pow(r/radius, 2.0) * 1.6);
+      float halo = exp(-pow(r/(radius*2.4), 2.0)) * 0.5;
+      float outer = exp(-pow(r/(radius*5.0), 2.0)) * 0.18;
+
+      float light = core + halo + outer;
+
+      // ── 微妙的脉动：持续按住时，光在"呼吸" ──
+      // 多层正弦叠加，非周期，永不重复
+      float breathe = 1.0
+        + 0.035*sin(t*1.7 + I*3.1)
+        + 0.022*sin(t*2.9 + 1.7)
+        + 0.014*sin(t*4.3 + 0.5*I)
+        + 0.010*sin(t*0.7);
+      light *= mix(1.0, breathe, 0.6 + 0.4*I);
+
+      // ── 触底脉冲：极短暂的提亮 ──
+      light *= 1.0 + u_pulse*0.35;
+
+      // ── 颜色：冷白蓝 → 暖琥珀，随强度渐变 ──
+      // 待机：近乎白的冷光；深按：温暖的琥珀
+      vec3 cold = vec3(0.86, 0.92, 1.00);
+      vec3 warm = vec3(1.00, 0.86, 0.68);
+      vec3 col = mix(cold, warm, smoothstep(0.0, 1.0, I));
+
+      // ── 边缘色散：暖光时边缘略带金 ──
+      float edge = smoothstep(radius*0.4, radius*2.2, r);
+      col = mix(col, vec3(1.0, 0.78, 0.55), edge * I * 0.5);
+
+      // ── 应用亮度 ──
+      float bright = mix(0.18, 1.15, I); // 待机时仍有微光，不彻底黑死
+      col *= light * bright;
+
+      // ── 极暗底：不是纯黑，是"几乎黑" ──
+      vec3 bg = vec3(0.012, 0.013, 0.015);
+      col = max(col, bg);
+
+      // ── 色调映射 ──
+      col = (col*(2.51*col+0.03))/(col*(2.43*col+0.59)+0.14);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  function compile(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog); gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  const U = {
+    res: gl.getUniformLocation(prog, 'u_res'),
+    time: gl.getUniformLocation(prog, 'u_time'),
+    intensity: gl.getUniformLocation(prog, 'u_intensity'),
+    life: gl.getUniformLocation(prog, 'u_life'),
+    pulse: gl.getUniformLocation(prog, 'u_pulse'),
+  };
+
+  function resize(){
+    const dpr = Math.min(devicePixelRatio||1, 2);
+    canvas.width = innerWidth*dpr; canvas.height = innerHeight*dpr;
+    gl.viewport(0,0,canvas.width,canvas.height);
+  }
+  addEventListener('resize', resize); resize();
+
+  /* ── 状态 ── */
+  let pressing = false;
+  let intensity = 0;   // 平滑强度
+  let pressVel = 0;
+  let pulse = 0;
+  let count = 0;
+  let bottomed = false;
+  let pressStartTime = 0;
+  const cnum = document.getElementById('cnum');
+
+  // 阻尼弹簧：按下快、回弹略慢，有"落下去"的重量感
+  function step(dt){
+    const target = pressing ? 1 : 0;
+    const K = pressing ? 16 : 9;
+    const C = 8.0;
+    const a = (target - intensity)*K - pressVel*C;
+    pressVel += a*dt;
+    intensity += pressVel*dt;
+    intensity = clamp(intensity, 0, 1);
+    pulse *= Math.pow(0.0008, dt);
+
+    if(pressing && intensity > 0.94 && !bottomed){
+      bottomed = true;
+      pulse = 1.0;
+      sndBottom();
+      count++;
+      cnum.textContent = count;
+      document.body.classList.add('alive');
+    }
+    if(intensity < 0.9) bottomed = false;
+    if(!pressing && intensity < 0.02){
+      document.body.classList.remove('alive');
+    }
+  }
+
+  /* ── 音频：持续的吟唱 ── */
+  let AC = null, drone = null, droneGain = null, droneFreq = null;
+  function ac(){ if(!AC){ AC = new (window.AudioContext||webkitAudioContext)(); } return AC; }
+
+  function startDrone(){
+    const a = ac(); if(a.state==='suspended') a.resume();
+    if(drone) return;
+    droneGain = a.createGain();
+    droneGain.gain.value = 0;
+    droneGain.connect(a.destination);
+
+    // 基频 + 纯五度，极其微弱的谐波
+    const osc1 = a.createOscillator();
+    const osc2 = a.createOscillator();
+    osc1.type = 'sine'; osc2.type = 'sine';
+    osc1.frequency.value = 130.81; // C3
+    osc2.frequency.value = 196.00; // G3
+    osc1.connect(droneGain);
+    osc2.connect(droneGain);
+    osc1.start(); osc2.start();
+    drone = { o1: osc1, o2: osc2 };
+    droneFreq = { f1: 130.81, f2: 196.00 };
+
+    // 淡入
+    droneGain.gain.linearRampToValueAtTime(0.16, a.currentTime + 0.6);
+  }
+  function stopDrone(){
+    if(!drone || !AC) return;
+    const a = AC;
+    const t = a.currentTime;
+    droneGain.gain.cancelScheduledValues(t);
+    droneGain.gain.setValueAtTime(droneGain.gain.value, t);
+    droneGain.gain.linearRampToValueAtTime(0, t + 1.4);
+    const d = drone;
+    setTimeout(()=>{ try{ d.o1.stop(); d.o2.stop(); }catch(e){} }, 1500);
+    drone = null; droneGain = null;
+  }
+  function sndBottom(){
+    const a = ac(); if(a.state==='suspended') a.resume();
+    const t = a.currentTime;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type='sine'; o.frequency.setValueAtTime(98,t);
+    o.frequency.exponentialRampToValueAtTime(52,t+0.5);
+    g.gain.setValueAtTime(0.3,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.55);
+    o.connect(g); g.connect(a.destination);
+    o.start(t); o.stop(t+0.58);
+  }
+
+  /* ── 持续按住时，音高随强度缓慢攀升 ── */
+  function updateDrone(){
+    if(drone && droneFreq && AC){
+      const t = AC.currentTime;
+      const f1 = 130.81 * (1 + intensity*0.35); // 升至约 E3
+      const f2 = 196.00 * (1 + intensity*0.35);
+      drone.o1.frequency.setTargetAtTime(f1, t, 0.15);
+      drone.o2.frequency.setTargetAtTime(f2, t, 0.15);
+      droneGain.gain.setTargetAtTime(0.10 + intensity*0.14, t, 0.2);
+    }
+  }
+
+  /* ── 事件 ── */
+  function down(e){ if(e&&e.cancelable)e.preventDefault(); if(pressing)return; pressing=true; ac(); startDrone(); pressStartTime=performance.now(); }
+  function up(e){ if(e&&e.cancelable)e.preventDefault(); if(!pressing)return; pressing=false; stopDrone(); }
+  addEventListener('pointerdown', down, {passive:false});
+  addEventListener('pointerup', up, {passive:false});
+  addEventListener('pointercancel', up, {passive:false});
+  addEventListener('keydown', e=>{ if(e.code==='Space'&&!e.repeat){ e.preventDefault(); down();} });
+  addEventListener('keyup', e=>{ if(e.code==='Space'){ e.preventDefault(); up();} });
+
+  /* ── 主循环 ── */
+  let prev = performance.now();
+  const clamp = (v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+  function frame(){
+    const t = performance.now();
+    let dt = (t-prev)/1000; prev = t;
+    step(Math.min(dt, 0.05));
+    updateDrone();
+
+    // 生命值：持续按住越久，脉动越有生命力
+    const life = pressing ? clamp((t - pressStartTime)/6000, 0, 1) : 0;
+
+    gl.uniform2f(U.res, canvas.width, canvas.height);
+    gl.uniform1f(U.time, t/1000);
+    gl.uniform1f(U.intensity, intensity);
+    gl.uniform1f(U.life, life);
+    gl.uniform1f(U.pulse, pulse);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
